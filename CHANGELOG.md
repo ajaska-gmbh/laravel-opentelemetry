@@ -2,6 +2,15 @@
 
 All notable changes to `laravel-opentelemetry` will be documented in this file.
 
+## v2.2.4 - 2026-07-07
+
+### What's Changed
+
+* Bump actions/cache from 5 to 6 by @dependabot[bot] in https://github.com/keepsuit/laravel-opentelemetry/pull/88
+* Fix queue span cleanup across job retries by @cappuc in https://github.com/keepsuit/laravel-opentelemetry/pull/90
+
+**Full Changelog**: https://github.com/keepsuit/laravel-opentelemetry/compare/2.2.3...2.2.4
+
 ## 2.2.3 - 2026-06-23
 
 ### What's Changed
@@ -214,6 +223,7 @@ Instrumentation\ConsoleInstrumentation::class => [
 
 
 
+
 ```
 **Full Changelog**: https://github.com/keepsuit/laravel-opentelemetry/compare/1.7.0...1.8.0
 
@@ -333,6 +343,7 @@ Tracer::newSpan('name')->setSpanKind(SpanKind::KIND_PRODUCER)->measure(callback)
 
 
 
+
 ```
 `Tracer::recordExceptionToSpan` has been removed and exception should be recorded directly to span: `$span->recordException($exception)`
 
@@ -353,6 +364,7 @@ This is the injected `otlp` channel:
         'level' => 'debug',
     ]
 ]
+
 
 
 
