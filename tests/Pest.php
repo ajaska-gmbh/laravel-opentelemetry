@@ -114,3 +114,11 @@ function registerInstrumentation(string $instrumentation, array $options = []): 
 
     app()->make($instrumentation)->register($options);
 }
+
+function executeQueueWork(): void
+{
+    Artisan::call('queue:work', [
+        '--once' => true,
+        '--timeout' => 1,
+    ]);
+}

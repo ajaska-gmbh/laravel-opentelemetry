@@ -2,6 +2,7 @@
 
 namespace Keepsuit\LaravelOpenTelemetry\Instrumentation;
 
+use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
@@ -133,27 +134,38 @@ class QueueInstrumentation implements Instrumentation
         });
 
         app('events')->listen(JobProcessed::class, function (JobProcessed $event) {
-            $scope = Tracer::activeScope();
-            $span = Tracer::activeSpan();
-
-            $scope?->detach();
-            $span->end();
+            $this->finishActiveJobSpan();
         });
 
         app('events')->listen(JobFailed::class, function (JobFailed $event) {
-            $scope = Tracer::activeScope();
-            $span = Tracer::activeSpan();
+            $this->finishActiveJobSpan($event->exception);
+        });
 
-            $span->recordException($event->exception)
-                ->setStatus(StatusCode::STATUS_ERROR);
+        app('events')->listen(JobExceptionOccurred::class, function (JobExceptionOccurred $event) {
+            if ($event->job->hasFailed()) {
+                return;
+            }
 
-            $scope?->detach();
-            $span->end();
+            $this->finishActiveJobSpan($event->exception);
         });
     }
 
     protected function connectionDriver(string $connection): string
     {
         return config(sprintf('queue.connections.%s.driver', $connection), 'unknown');
+    }
+
+    protected function finishActiveJobSpan(?Throwable $exception = null): void
+    {
+        $scope = Tracer::activeScope();
+        $span = Tracer::activeSpan();
+
+        if ($exception !== null) {
+            $span->recordException($exception)
+                ->setStatus(StatusCode::STATUS_ERROR);
+        }
+
+        $scope?->detach();
+        $span->end();
     }
 }
