@@ -1,10 +1,10 @@
 <?php
 
-use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
 use Keepsuit\LaravelOpenTelemetry\Facades\Tracer;
 use Keepsuit\LaravelOpenTelemetry\Instrumentation\QueryInstrumentation;
 use Keepsuit\LaravelOpenTelemetry\Instrumentation\QueueInstrumentation;
+use Keepsuit\LaravelOpenTelemetry\Tests\Support\RetryingTestJob;
 use Keepsuit\LaravelOpenTelemetry\Tests\Support\TestJob;
 use OpenTelemetry\API\Trace\StatusCode;
 use OpenTelemetry\SDK\Trace\ImmutableSpan;
@@ -37,9 +37,7 @@ test('job process span is created without parent', function () {
 
     dispatch(new TestJob($this->valuestore));
 
-    Artisan::call('queue:work', [
-        '--once' => true,
-    ]);
+    executeQueueWork();
 
     $root = getRecordedSpans()->last();
 
@@ -53,9 +51,7 @@ it('can trace queue jobs', function () {
         dispatch(new TestJob($this->valuestore));
     });
 
-    Artisan::call('queue:work', [
-        '--once' => true,
-    ]);
+    executeQueueWork();
 
     $root = getRecordedSpans()->first(fn (ImmutableSpan $span) => $span->getName() === 'root');
     $enqueueSpan = getRecordedSpans()->first(fn (ImmutableSpan $span) => $span->getName() === 'send default');
@@ -145,9 +141,7 @@ it('can trace queue jobs dispatched after commit', function () {
         });
     });
 
-    Artisan::call('queue:work', [
-        '--once' => true,
-    ]);
+    executeQueueWork();
 
     $root = getRecordedSpans()->first(fn (ImmutableSpan $span) => $span->getName() === 'root');
     $sqlSpan = getRecordedSpans()->first(fn (ImmutableSpan $span) => $span->getName() === 'SELECT');
@@ -180,11 +174,7 @@ it('can trace queue failing jobs', function () {
         dispatch(new TestJob($this->valuestore, fail: true));
     });
 
-    Artisan::call('queue:work', [
-        '--once' => true,
-        '--tries' => 1,
-        '--timeout' => 3,
-    ]);
+    executeQueueWork();
 
     $root = getRecordedSpans()->first(fn (ImmutableSpan $span) => $span->getName() === 'root');
     $enqueueSpan = getRecordedSpans()->first(fn (ImmutableSpan $span) => $span->getName() === 'send default');
@@ -224,4 +214,56 @@ it('can trace queue failing jobs', function () {
             MessagingIncubatingAttributes::MESSAGING_DESTINATION_NAME => 'default',
             'messaging.message.job_name' => TestJob::class,
         ]);
+});
+
+it('does not leak the active consumer span between retry attempts and later jobs', function () {
+    $retryingJobStore = Valuestore::make(__DIR__.'/retryingTestJob.json')->flush();
+    $followingJobStore = Valuestore::make(__DIR__.'/followingTestJob.json')->flush();
+
+    // First attempt fails, the second succeed
+    dispatch(new RetryingTestJob($retryingJobStore));
+
+    executeQueueWork();
+
+    dispatch(new TestJob($followingJobStore));
+
+    executeQueueWork();
+    executeQueueWork();
+
+    $retryTraceIds = $retryingJobStore->get('traceIdInJobAttempts');
+    $retryUuid = $retryingJobStore->get('uuid');
+    $followingUuid = $followingJobStore->get('uuid');
+
+    $processSpans = getRecordedSpans()
+        ->filter(fn (ImmutableSpan $span) => $span->getName() === 'process default')
+        ->values();
+
+    $retryProcessSpans = $processSpans
+        ->filter(fn (ImmutableSpan $span) => $span->getAttributes()->get(MessagingIncubatingAttributes::MESSAGING_MESSAGE_ID) === $retryUuid)
+        ->values();
+
+    $followingProcessSpan = $processSpans
+        ->first(fn (ImmutableSpan $span) => $span->getAttributes()->get(MessagingIncubatingAttributes::MESSAGING_MESSAGE_ID) === $followingUuid);
+
+    expect($retryTraceIds)
+        ->toHaveCount(2)
+        ->and($retryTraceIds[0])->not->toBeNull()
+        ->and($retryTraceIds[1])->not->toBeNull()
+        ->and($retryTraceIds[1])->not->toBe($retryTraceIds[0]);
+
+    expect($retryingJobStore->get('traceparentInJobAttempts'))
+        ->toBe([null, null]);
+
+    expect($retryProcessSpans)
+        ->toHaveCount(2)
+        ->and($retryProcessSpans[0]->getStatus()->getCode())->toBe(StatusCode::STATUS_ERROR)
+        ->and($retryProcessSpans[0]->getEvents())->toHaveCount(1)
+        ->and($retryProcessSpans[1]->getStatus()->getCode())->toBe(StatusCode::STATUS_UNSET);
+
+    expect($followingProcessSpan)
+        ->not->toBeNull()
+        ->getTraceId()->not->toBe($retryTraceIds[1]);
+
+    $retryingJobStore->flush();
+    $followingJobStore->flush();
 });
