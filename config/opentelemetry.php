@@ -223,6 +223,23 @@ return [
 
         Instrumentation\QueueInstrumentation::class => filter_var(env('OTEL_INSTRUMENTATION_QUEUE', true), FILTER_VALIDATE_BOOLEAN),
 
+        /**
+         * Laravel Horizon fleet metrics (queue depth, wait time, throughput, supervisors).
+         *
+         * Published from the queue workers themselves: one process per interval is elected by a
+         * short cache lock and takes the reading, so the numbers appear without anything being
+         * scheduled. `interval` is both the publish period and the TTL of that lock.
+         *
+         * Off by default because it requires Laravel Horizon.
+         */
+        Instrumentation\HorizonInstrumentation::class => [
+            'enabled' => filter_var(env('OTEL_INSTRUMENTATION_HORIZON', false), FILTER_VALIDATE_BOOLEAN),
+            'interval' => (int) env('OTEL_INSTRUMENTATION_HORIZON_INTERVAL', 60),
+            // Cache store used for the election lock; null uses the default store. It must be a
+            // store shared by every worker — a per-process store would elect every process.
+            'lock_store' => env('OTEL_INSTRUMENTATION_HORIZON_LOCK_STORE'),
+        ],
+
         Instrumentation\CacheInstrumentation::class => filter_var(env('OTEL_INSTRUMENTATION_CACHE', true), FILTER_VALIDATE_BOOLEAN),
 
         Instrumentation\EventInstrumentation::class => [

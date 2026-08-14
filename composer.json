@@ -32,6 +32,7 @@
         "guzzlehttp/psr7": "^2.0",
         "guzzlehttp/test-server": "^0.5",
         "larastan/larastan": "^3.0",
+        "laravel/horizon": "^5.29",
         "laravel/octane": "^2.13",
         "laravel/pint": "^1.18",
         "laravel/scout": "^10.23 || ^11.0",
@@ -55,8 +56,9 @@
     },
     "suggest": {
         "ext-opentelemetry": "Required for some instrumentation (scout)",
-        "open-telemetry/extension-propagator-b3": "Required to use B3 propagator",
+        "laravel/horizon": "Required for the Horizon fleet metrics instrumentation",
         "open-telemetry/exporter-zipkin": "Required to Zipkin exporter",
+        "open-telemetry/extension-propagator-b3": "Required to use B3 propagator",
         "open-telemetry/transport-grpc": "Required to use OTLP gRPC exporter"
     },
     "conflict": {

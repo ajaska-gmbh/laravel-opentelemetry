@@ -2,6 +2,7 @@
 
 namespace Keepsuit\LaravelOpenTelemetry\Instrumentation;
 
+use Illuminate\Contracts\Queue\Job;
 use Illuminate\Queue\Events\JobExceptionOccurred;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
@@ -10,11 +11,15 @@ use Illuminate\Queue\Events\JobQueued;
 use Illuminate\Queue\QueueManager;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Str;
+use Keepsuit\LaravelOpenTelemetry\Facades\Meter;
 use Keepsuit\LaravelOpenTelemetry\Facades\Tracer;
 use Keepsuit\LaravelOpenTelemetry\Instrumentation\Support\InstrumentationUtilities;
+use OpenTelemetry\API\Common\Time\Clock;
+use OpenTelemetry\API\Common\Time\ClockInterface;
 use OpenTelemetry\API\Trace\SpanInterface;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
+use OpenTelemetry\SemConv\Attributes\ErrorAttributes;
 use OpenTelemetry\SemConv\Incubating\Attributes\MessagingIncubatingAttributes;
 use Throwable;
 
@@ -24,9 +29,30 @@ class QueueInstrumentation implements Instrumentation
     use SpanTimeAdapter;
 
     /**
+     * Metric names from the messaging semantic conventions.
+     *
+     * @see https://opentelemetry.io/docs/specs/semconv/messaging/messaging-metrics/
+     *
+     * Declared here rather than taken from `open-telemetry/sem-conv` because that package ships no
+     * `MessagingIncubatingMetrics` class yet; the attribute constants it does ship are used below.
+     */
+    public const METRIC_SENT_MESSAGES = 'messaging.client.sent.messages';
+
+    public const METRIC_CONSUMED_MESSAGES = 'messaging.client.consumed.messages';
+
+    public const METRIC_OPERATION_DURATION = 'messaging.client.operation.duration';
+
+    /**
      * @var array<string,SpanInterface>
      */
     protected array $activeSpans = [];
+
+    /**
+     * Consumer start timestamps in nanoseconds, keyed by connection+job id.
+     *
+     * @var array<string,int>
+     */
+    protected array $processingStartedAt = [];
 
     public function register(array $options): void
     {
@@ -39,6 +65,8 @@ class QueueInstrumentation implements Instrumentation
         $this->callAfterResolving('queue', $this->registerQueueInterceptor(...));
 
         app('events')->listen(JobQueued::class, function (JobQueued $event) {
+            $this->recordSentMessage($event);
+
             $uuid = $event->payload()['uuid'] ?? null;
 
             if (! is_string($uuid)) {
@@ -130,24 +158,114 @@ class QueueInstrumentation implements Instrumentation
 
             $span->activate();
 
+            // Start of the consumer operation, for `messaging.client.operation.duration`. Keyed by
+            // job id rather than held in a scalar because a worker can, in principle, see a nested
+            // dispatch; an unmatched id simply yields no duration rather than a wrong one.
+            $this->processingStartedAt[$this->jobKey($event->connectionName, $event->job)] = Clock::getDefault()->now();
+
             Tracer::updateLogContext();
         });
 
         app('events')->listen(JobProcessed::class, function (JobProcessed $event) {
+            $this->recordConsumedMessage($event->connectionName, $event->job, null);
+
             $this->finishActiveJobSpan();
         });
 
         app('events')->listen(JobFailed::class, function (JobFailed $event) {
+            $this->recordConsumedMessage($event->connectionName, $event->job, $event->exception);
+
             $this->finishActiveJobSpan($event->exception);
         });
 
         app('events')->listen(JobExceptionOccurred::class, function (JobExceptionOccurred $event) {
             if ($event->job->hasFailed()) {
+                // JobFailed follows and records it; counting here too would double-count the
+                // failure of a single job.
                 return;
             }
 
+            $this->recordConsumedMessage($event->connectionName, $event->job, $event->exception);
+
             $this->finishActiveJobSpan($event->exception);
         });
+    }
+
+    /**
+     * One message produced onto a queue.
+     */
+    protected function recordSentMessage(JobQueued $event): void
+    {
+        // `$event->queue`, not `$event->job->queue`: `job` is `object|string` (a string class name
+        // for a raw push), and the event carries the resolved queue itself. `Str::after` mirrors the
+        // producer span, so the counter and the span agree on the queue's name.
+        $queueName = Str::after((string) ($event->queue ?? 'default'), 'queues:');
+
+        Meter::counter(
+            name: self::METRIC_SENT_MESSAGES,
+            unit: '{message}',
+            description: 'Number of messages producers attempted to send to the broker.'
+        )->add(1, [
+            MessagingIncubatingAttributes::MESSAGING_SYSTEM => $this->connectionDriver($event->connectionName),
+            MessagingIncubatingAttributes::MESSAGING_DESTINATION_NAME => $queueName,
+        ]);
+    }
+
+    /**
+     * One message consumed, and how long it took.
+     *
+     * A FAILURE IS THE SAME COUNTER WITH AN `error.type` ATTRIBUTE, not a separate `*.failed`
+     * instrument. That is the semantic-convention shape, and it is the useful one: the failure
+     * RATE is then a single ratio over one metric instead of a division across two whose
+     * denominators may not line up.
+     */
+    protected function recordConsumedMessage(string $connectionName, Job $job, ?Throwable $exception): void
+    {
+        $attributes = [
+            MessagingIncubatingAttributes::MESSAGING_SYSTEM => $this->connectionDriver($connectionName),
+            MessagingIncubatingAttributes::MESSAGING_DESTINATION_NAME => $job->getQueue(),
+        ];
+
+        if ($exception !== null) {
+            // The class name, never the message: a message can carry ids, emails or SQL, and an
+            // attribute value becomes a metric label — which is unbounded cardinality plus a
+            // possible data leak into the metrics backend.
+            $attributes[ErrorAttributes::ERROR_TYPE] = $exception::class;
+        }
+
+        Meter::counter(
+            name: self::METRIC_CONSUMED_MESSAGES,
+            unit: '{message}',
+            description: 'Number of messages that were delivered to the application.'
+        )->add(1, $attributes);
+
+        $key = $this->jobKey($connectionName, $job);
+        $startedAt = $this->processingStartedAt[$key] ?? null;
+        unset($this->processingStartedAt[$key]);
+
+        if ($startedAt === null) {
+            return;
+        }
+
+        Meter::histogram(
+            name: self::METRIC_OPERATION_DURATION,
+            unit: 's',
+            description: 'Duration of messaging operation initiated by a producer or consumer client.',
+            advisory: [
+                'ExplicitBucketBoundaries' => [0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0],
+            ]
+        )->record((Clock::getDefault()->now() - $startedAt) / ClockInterface::NANOS_PER_SECOND, $attributes);
+    }
+
+    /**
+     * Identifies one in-flight consumer operation.
+     *
+     * `getJobId()` rather than `uuid()`: the sync driver and some custom drivers leave the uuid
+     * null, and a null key would collide across jobs — attributing one job's duration to another.
+     */
+    protected function jobKey(string $connection, Job $job): string
+    {
+        return $connection.'|'.($job->getJobId() ?: spl_object_hash($job));
     }
 
     protected function connectionDriver(string $connection): string

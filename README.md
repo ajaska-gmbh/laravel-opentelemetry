@@ -430,7 +430,67 @@ You can disable this instrumentation by setting `OTEL_INSTRUMENTATION_QUERY` to 
 
 Queue jobs are automatically traced. The instrumentation creates a parent span with kind `PRODUCER` when a job is dispatched and a child span with kind `CONSUMER` when the job is executed.
 
+Metrics:
+
+- `messaging.client.sent.messages` (counter) - Messages produced onto a queue
+- `messaging.client.consumed.messages` (counter) - Messages delivered to the application
+- `messaging.client.operation.duration` (histogram, seconds) - Duration of the consumer operation
+
+A failed job is the **same** `consumed.messages` counter with an `error.type` attribute holding the
+exception class, rather than a separate counter. That is the shape the semantic conventions define,
+and it makes the failure rate a single ratio over one metric:
+
+```promql
+sum(rate(messaging_client_consumed_messages_total{error_type!=""}[5m]))
+  / sum(rate(messaging_client_consumed_messages_total[5m]))
+```
+
 You can disable this instrumentation by setting `OTEL_INSTRUMENTATION_QUEUE` to `false` or removing `QueueInstrumentation::class` from the config.
+
+### Horizon
+
+Fleet-level metrics for [Laravel Horizon](https://laravel.com/docs/horizon): queue depth, wait time,
+throughput and whether Horizon is running.
+
+These are deliberately **not** covered by the queue instrumentation above. That one measures jobs as
+they pass through a worker, and no amount of job-level data answers "how many jobs are waiting" —
+queue depth is a property of the queue at an instant, not of any job that ran. A queue that has
+stopped being consumed emits no job events at all, so from that signal alone a wedged fleet looks
+exactly like an idle one.
+
+Metrics:
+
+- `laravel.horizon.queue.length` (gauge, per `queue`) - Jobs waiting
+- `laravel.horizon.queue.wait_time` (gauge, seconds, per `queue`) - How long the oldest job has waited
+- `laravel.horizon.queue.processes` (gauge, per `queue`) - Worker processes assigned
+- `laravel.horizon.jobs_per_minute` (gauge) - Throughput as Horizon measures it
+- `laravel.horizon.jobs.recent` / `laravel.horizon.jobs.failed_recent` (gauges)
+- `laravel.horizon.supervisors` (gauge) - Master supervisors registered
+
+Enable it with `OTEL_INSTRUMENTATION_HORIZON=true` (off by default, since it requires Horizon).
+Nothing else to wire up: the metrics are published from the queue workers themselves.
+
+These numbers are fleet-wide, so they must not be emitted once per worker process — that would
+publish one identical copy of each value per process and run a Redis workload scan per process per
+collection. Instead every worker registers the same observable callback, and on each collection the
+callback tries to take a short lock: the process that wins takes the reading, the rest observe
+nothing. The lock is never released, only left to expire, so its TTL *is* the publish interval
+(`OTEL_INSTRUMENTATION_HORIZON_INTERVAL`, 60 seconds by default).
+
+The lock uses the default cache store unless `OTEL_INSTRUMENTATION_HORIZON_LOCK_STORE` names another.
+It must be a store shared by every worker — a per-process store such as `array` would elect all of
+them.
+
+**Detecting that Horizon is down is the one thing this cannot do.** The publisher lives inside the
+workers, so when Horizon stops there is nobody left to report it: a total outage shows up as the
+metrics going *absent*, not as a zero. Alert on absence:
+
+```promql
+absent_over_time(laravel_horizon_queue_length[10m])
+```
+
+There is deliberately no `horizon.up` gauge, because from inside the fleet it could only ever report
+"healthy" — and somebody would eventually build an alert on a value it can never take.
 
 ### Redis
 
