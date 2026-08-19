@@ -3,9 +3,13 @@
 namespace Keepsuit\LaravelOpenTelemetry\Instrumentation;
 
 use Illuminate\Contracts\Cache\LockProvider;
+use Illuminate\Queue\Events\JobFailed;
+use Illuminate\Queue\Events\JobProcessed;
+use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 use Keepsuit\LaravelOpenTelemetry\Facades\Meter;
+use Keepsuit\LaravelOpenTelemetry\Instrumentation\Support\Horizon\JobMemoryStore;
 use Laravel\Horizon\Contracts\JobRepository;
 use Laravel\Horizon\Contracts\MasterSupervisorRepository;
 use Laravel\Horizon\Contracts\MetricsRepository;
@@ -58,6 +62,16 @@ class HorizonInstrumentation implements Instrumentation
 
     public const METRIC_SUPERVISORS = 'laravel.horizon.supervisors';
 
+    public const METRIC_JOB_MEMORY_PEAK_AVG = 'laravel.horizon.job.memory.peak.avg';
+
+    public const METRIC_JOB_MEMORY_PEAK_MAX = 'laravel.horizon.job.memory.peak.max';
+
+    public const METRIC_JOB_MEMORY_ADDED_AVG = 'laravel.horizon.job.memory.added.avg';
+
+    public const METRIC_JOB_PROCESSED = 'laravel.horizon.job.processed';
+
+    public const METRIC_JOB_RUNNING = 'laravel.horizon.job.running';
+
     /** Seconds between publishes, fleet-wide. Also the TTL of the election lock. */
     public const DEFAULT_INTERVAL = 60;
 
@@ -73,6 +87,8 @@ class HorizonInstrumentation implements Instrumentation
      */
     protected static ?ObservableCallbackInterface $callback = null;
 
+    protected static array $baselines = [];
+
     public function register(array $options): void
     {
         if (! interface_exists(WorkloadRepository::class)) {
@@ -83,6 +99,12 @@ class HorizonInstrumentation implements Instrumentation
 
         $interval = max(1, (int) ($options['interval'] ?? self::DEFAULT_INTERVAL));
         $store = $options['lock_store'] ?? null;
+        $memory = ($options['job_memory'] ?? true) !== false;
+        $memoryStore = new JobMemoryStore($options['redis_connection'] ?? null);
+
+        if ($memory) {
+            $this->recordJobMemory($memoryStore, $interval);
+        }
 
         self::$callback = Meter::batchObserve(
             [
@@ -93,6 +115,11 @@ class HorizonInstrumentation implements Instrumentation
                 Meter::observableGauge(self::METRIC_JOBS_RECENT, '{job}', 'Jobs processed in Horizon\'s recent window.'),
                 Meter::observableGauge(self::METRIC_JOBS_FAILED_RECENT, '{job}', 'Jobs that failed in Horizon\'s recent window.'),
                 Meter::observableGauge(self::METRIC_SUPERVISORS, '{supervisor}', 'Master supervisors currently registered.'),
+                Meter::observableGauge(self::METRIC_JOB_MEMORY_PEAK_AVG, 'By', 'Mean process memory high-water mark while running this job.'),
+                Meter::observableGauge(self::METRIC_JOB_MEMORY_PEAK_MAX, 'By', 'Largest process memory high-water mark while running this job.'),
+                Meter::observableGauge(self::METRIC_JOB_MEMORY_ADDED_AVG, 'By', 'Mean memory the job allocated above the memory already resident in the worker.'),
+                Meter::observableGauge(self::METRIC_JOB_PROCESSED, '{job}', 'Jobs of this class completed on this queue in the last window.'),
+                Meter::observableGauge(self::METRIC_JOB_RUNNING, '{job}', 'Jobs of this class currently executing on this queue.'),
             ],
             function (
                 ObserverInterface $length,
@@ -102,7 +129,12 @@ class HorizonInstrumentation implements Instrumentation
                 ObserverInterface $recent,
                 ObserverInterface $failed,
                 ObserverInterface $supervisors,
-            ) use ($interval, $store): void {
+                ObserverInterface $memoryPeakAvg,
+                ObserverInterface $memoryPeakMax,
+                ObserverInterface $memoryAddedAvg,
+                ObserverInterface $jobProcessed,
+                ObserverInterface $jobRunning,
+            ) use ($interval, $store, $memory, $memoryStore): void {
                 if (! $this->winsElection($interval, $store)) {
                     return;
                 }
@@ -117,6 +149,21 @@ class HorizonInstrumentation implements Instrumentation
                     $this->observeThroughput($perMinute, $recent, $failed);
 
                     $supervisors->observe(count(app(MasterSupervisorRepository::class)->all()));
+                } catch (\Throwable) {
+                }
+
+                try {
+                    if ($memory) {
+                        $this->observeJobMemory(
+                            $memoryStore,
+                            $interval,
+                            $memoryPeakAvg,
+                            $memoryPeakMax,
+                            $memoryAddedAvg,
+                            $jobProcessed,
+                            $jobRunning,
+                        );
+                    }
                 } catch (\Throwable) {
                     // Swallowed, and deliberately NOT reported: this package installs a `reportable`
                     // hook that records any reported exception on the ACTIVE SPAN and marks it
@@ -159,6 +206,79 @@ class HorizonInstrumentation implements Instrumentation
             $length->observe((int) ($workload['length'] ?? 0), $attributes);
             $wait->observe((float) ($workload['wait'] ?? 0), $attributes);
             $processes->observe((int) ($workload['processes'] ?? 0), $attributes);
+        }
+    }
+
+    protected function recordJobMemory(JobMemoryStore $store, int $interval): void
+    {
+        $events = app('events');
+
+        $events->listen(JobProcessing::class, function (JobProcessing $event) use ($store, $interval): void {
+            $key = $this->jobKey($event->job);
+
+            self::$baselines[$key] = memory_get_usage(true);
+
+            if (function_exists('memory_reset_peak_usage')) {
+                memory_reset_peak_usage();
+            }
+
+            $store->adjustRunning(
+                JobMemoryStore::normalizeQueue($event->job->getQueue()),
+                $event->job->resolveName(),
+                1,
+                $interval
+            );
+        });
+
+        $finish = function (JobProcessed|JobFailed $event) use ($store, $interval): void {
+            $key = $this->jobKey($event->job);
+            $baseline = self::$baselines[$key] ?? memory_get_usage(true);
+            unset(self::$baselines[$key]);
+
+            $peak = memory_get_peak_usage(true);
+            $queue = JobMemoryStore::normalizeQueue($event->job->getQueue());
+            $job = $event->job->resolveName();
+
+            $store->record($queue, $job, $peak, $peak > $baseline ? $peak - $baseline : 0, $interval);
+            $store->adjustRunning($queue, $job, -1, $interval);
+        };
+
+        $events->listen(JobProcessed::class, $finish);
+        $events->listen(JobFailed::class, $finish);
+    }
+
+    protected function jobKey(object $job): string
+    {
+        if (! method_exists($job, 'getJobId')) {
+            return spl_object_hash($job);
+        }
+
+        $id = $job->getJobId();
+
+        return is_string($id) && $id !== '' ? $id : spl_object_hash($job);
+    }
+
+    protected function observeJobMemory(
+        JobMemoryStore $store,
+        int $interval,
+        ObserverInterface $peakAvg,
+        ObserverInterface $peakMax,
+        ObserverInterface $addedAvg,
+        ObserverInterface $processed,
+        ObserverInterface $running,
+    ): void {
+        foreach ($store->readCompletedBucket($interval) as $row) {
+            $attributes = ['queue' => $row['queue'], 'job_name' => $row['job']];
+            $count = max(1, (int) ($row['count'] ?? 0));
+
+            $peakAvg->observe(intdiv((int) ($row['sum_peak'] ?? 0), $count), $attributes);
+            $peakMax->observe((int) ($row['max_peak'] ?? 0), $attributes);
+            $addedAvg->observe(intdiv((int) ($row['sum_added'] ?? 0), $count), $attributes);
+            $processed->observe((int) ($row['count'] ?? 0), $attributes);
+        }
+
+        foreach ($store->readRunning() as $row) {
+            $running->observe($row['running'], ['queue' => $row['queue'], 'job_name' => $row['job']]);
         }
     }
 
