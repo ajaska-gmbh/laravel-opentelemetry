@@ -100,6 +100,7 @@ class HorizonInstrumentation implements Instrumentation
         $interval = max(1, (int) ($options['interval'] ?? self::DEFAULT_INTERVAL));
         $store = $options['lock_store'] ?? null;
         $memory = ($options['job_memory'] ?? true) !== false;
+        $windowBuckets = max(1, (int) ($options['job_memory_window'] ?? JobMemoryStore::WINDOW_BUCKETS));
         $memoryStore = new JobMemoryStore($options['redis_connection'] ?? null);
 
         if ($memory) {
@@ -134,7 +135,7 @@ class HorizonInstrumentation implements Instrumentation
                 ObserverInterface $memoryAddedAvg,
                 ObserverInterface $jobProcessed,
                 ObserverInterface $jobRunning,
-            ) use ($interval, $store, $memory, $memoryStore): void {
+            ) use ($interval, $store, $memory, $memoryStore, $windowBuckets): void {
                 if (! $this->winsElection($interval, $store)) {
                     return;
                 }
@@ -157,6 +158,7 @@ class HorizonInstrumentation implements Instrumentation
                         $this->observeJobMemory(
                             $memoryStore,
                             $interval,
+                            $windowBuckets,
                             $memoryPeakAvg,
                             $memoryPeakMax,
                             $memoryAddedAvg,
@@ -261,13 +263,14 @@ class HorizonInstrumentation implements Instrumentation
     protected function observeJobMemory(
         JobMemoryStore $store,
         int $interval,
+        int $windowBuckets,
         ObserverInterface $peakAvg,
         ObserverInterface $peakMax,
         ObserverInterface $addedAvg,
         ObserverInterface $processed,
         ObserverInterface $running,
     ): void {
-        foreach ($store->readCompletedBucket($interval) as $row) {
+        foreach ($store->readWindow($interval, $windowBuckets) as $row) {
             $attributes = ['queue' => $row['queue'], 'job_name' => $row['job']];
             $count = max(1, (int) ($row['count'] ?? 0));
 
