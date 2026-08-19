@@ -88,8 +88,6 @@ it('records peak memory, added memory and a completion count per job and queue',
     runFakeJob('App\\Jobs\\Import', 'import-older', 'j2');
 
     $store = new JobMemoryStore;
-    $rows = $store->readCompletedBucket(HorizonInstrumentation::DEFAULT_INTERVAL);
-
     $current = invade($store)->bucketKey(HorizonInstrumentation::DEFAULT_INTERVAL, 0);
     $raw = Redis::connection()->hgetall($current);
 
@@ -134,7 +132,7 @@ it('never reports a negative in-flight count', function () {
     expect($running['running'])->toBe(0);
 });
 
-it('publishes averages and the max from the completed bucket', function () {
+it('publishes averages and the max from the rolling window', function () {
 
     $store = new JobMemoryStore;
     $previous = invade($store)->bucketKey(HorizonInstrumentation::DEFAULT_INTERVAL, -1);
@@ -162,6 +160,65 @@ it('publishes nothing for a window in which no job ran', function () {
     registerInstrumentation(HorizonInstrumentation::class);
 
     expect(memoryGauge(HorizonInstrumentation::METRIC_JOB_MEMORY_PEAK_AVG)->data->dataPoints)->toBeEmpty();
+});
+
+it('keeps reporting a job for the whole rolling window, not only the window it ran in', function () {
+    $store = new JobMemoryStore;
+    $interval = HorizonInstrumentation::DEFAULT_INTERVAL;
+
+    $old = invade($store)->bucketKey($interval, -6);
+
+    Redis::connection()->hmset($old, [
+        'leads-older|App\\Jobs\\Rare|count' => 2,
+        'leads-older|App\\Jobs\\Rare|sum_peak' => 200,
+        'leads-older|App\\Jobs\\Rare|max_peak' => 150,
+        'leads-older|App\\Jobs\\Rare|sum_added' => 40,
+    ]);
+
+    registerInstrumentation(HorizonInstrumentation::class);
+
+    expect(pointsByJob(memoryGauge(HorizonInstrumentation::METRIC_JOB_MEMORY_PEAK_AVG)))
+        ->toBe(['leads-older|App\\Jobs\\Rare' => 100]);
+});
+
+it('merges several buckets: sums the counts and takes the largest peak', function () {
+    $store = new JobMemoryStore;
+    $interval = HorizonInstrumentation::DEFAULT_INTERVAL;
+
+    Redis::connection()->hmset(invade($store)->bucketKey($interval, -1), [
+        'live|App\\Jobs\\Busy|count' => 2,
+        'live|App\\Jobs\\Busy|sum_peak' => 100,
+        'live|App\\Jobs\\Busy|max_peak' => 60,
+        'live|App\\Jobs\\Busy|sum_added' => 20,
+    ]);
+    Redis::connection()->hmset(invade($store)->bucketKey($interval, -3), [
+        'live|App\\Jobs\\Busy|count' => 2,
+        'live|App\\Jobs\\Busy|sum_peak' => 300,
+        'live|App\\Jobs\\Busy|max_peak' => 200,
+        'live|App\\Jobs\\Busy|sum_added' => 60,
+    ]);
+
+    registerInstrumentation(HorizonInstrumentation::class);
+
+    expect(pointsByJob(memoryGauge(HorizonInstrumentation::METRIC_JOB_PROCESSED)))
+        ->toBe(['live|App\\Jobs\\Busy' => 4])
+        ->and(pointsByJob(memoryGauge(HorizonInstrumentation::METRIC_JOB_MEMORY_PEAK_AVG)))
+        ->toBe(['live|App\\Jobs\\Busy' => 100])
+        ->and(pointsByJob(memoryGauge(HorizonInstrumentation::METRIC_JOB_MEMORY_PEAK_MAX)))
+        ->toBe(['live|App\\Jobs\\Busy' => 200]);
+});
+
+it('aggregates across many worker processes writing the same job and queue', function () {
+    registerInstrumentation(HorizonInstrumentation::class);
+
+    foreach (['w1', 'w2', 'w3', 'w4'] as $i => $id) {
+        runFakeJob('App\\Jobs\\Shared', 'leads', $id);
+    }
+
+    $store = new JobMemoryStore;
+    $raw = Redis::connection()->hgetall(invade($store)->bucketKey(HorizonInstrumentation::DEFAULT_INTERVAL, 0));
+
+    expect((int) $raw['leads|App\\Jobs\\Shared|count'])->toBe(4);
 });
 
 it('labels the queue so it joins with the fleet metrics', function () {

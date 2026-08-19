@@ -11,7 +11,9 @@ class JobMemoryStore
 
     public const RUNNING_KEY = 'otel:horizon:jobrunning';
 
-    public const KEEP_BUCKETS = 5;
+    public const KEEP_BUCKETS = 15;
+
+    public const WINDOW_BUCKETS = 10;
 
     protected ?string $connection;
 
@@ -51,28 +53,48 @@ class JobMemoryStore
         );
     }
 
-    public function readCompletedBucket(int $interval): array
+    public function readWindow(int $interval, ?int $buckets = null): array
     {
+        $buckets = max(1, $buckets ?? self::WINDOW_BUCKETS);
         $rows = [];
 
-        foreach ($this->hgetall($this->bucketKey($interval, -1)) as $field => $value) {
-            $parts = explode('|', (string) $field);
+        for ($offset = -1; $offset >= -$buckets; $offset--) {
+            foreach ($this->hgetall($this->bucketKey($interval, $offset)) as $field => $value) {
+                $parts = explode('|', (string) $field);
 
-            if (count($parts) !== 3) {
-                continue;
+                if (count($parts) !== 3) {
+                    continue;
+                }
+
+                [$queue, $job, $metric] = $parts;
+                $key = $queue.'|'.$job;
+
+                if (! isset($rows[$key])) {
+                    $rows[$key] = [
+                        'queue' => $queue,
+                        'job' => $job,
+                        'count' => 0,
+                        'sum_peak' => 0,
+                        'max_peak' => 0,
+                        'sum_added' => 0,
+                    ];
+                }
+
+                $amount = (int) $value;
+
+                if ($metric === 'max_peak') {
+                    $rows[$key]['max_peak'] = max($rows[$key]['max_peak'], $amount);
+                } elseif ($metric === 'count') {
+                    $rows[$key]['count'] += $amount;
+                } elseif ($metric === 'sum_peak') {
+                    $rows[$key]['sum_peak'] += $amount;
+                } elseif ($metric === 'sum_added') {
+                    $rows[$key]['sum_added'] += $amount;
+                }
             }
-
-            [$queue, $job, $metric] = $parts;
-
-            $rows[$queue.'|'.$job]['queue'] = $queue;
-            $rows[$queue.'|'.$job]['job'] = $job;
-            $rows[$queue.'|'.$job][$metric] = (int) $value;
         }
 
-        return array_values(array_filter(
-            $rows,
-            fn (array $row) => ($row['count'] ?? 0) > 0
-        ));
+        return array_values(array_filter($rows, fn (array $row): bool => $row['count'] > 0));
     }
 
     public function readRunning(): array
