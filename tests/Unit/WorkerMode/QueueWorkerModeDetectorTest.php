@@ -2,6 +2,9 @@
 
 use Illuminate\Contracts\Queue\Job;
 use Illuminate\Queue\Events\JobAttempted;
+use Illuminate\Queue\Events\Looping;
+use Illuminate\Queue\Events\WorkerStopping;
+use Illuminate\Support\Facades\Event;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\Detectors\QueueWorkerModeDetector;
 
 test('detects when queue:work is running', function () {
@@ -46,6 +49,34 @@ test('registers callback for JobAttempted event', function () {
     $mockJob->shouldReceive('hasFailed')->andReturn(false);
 
     event(new JobAttempted('default', $mockJob, false));
+
+    expect($called)->toBeTrue();
+});
+
+test('ticks on the Looping event and never pauses the worker', function () {
+    $detector = new QueueWorkerModeDetector;
+    $called = 0;
+
+    $detector->onTick(function () use (&$called) {
+        $called++;
+
+        return false;
+    });
+
+    // The worker pauses when until(Looping) returns false; ours must return nothing.
+    expect(Event::until(new Looping('redis', 'default')))->toBeNull()
+        ->and($called)->toBe(1);
+});
+
+test('registers callback for the WorkerStopping event', function () {
+    $detector = new QueueWorkerModeDetector;
+    $called = false;
+
+    $detector->onWorkerStopping(function () use (&$called) {
+        $called = true;
+    });
+
+    event(new WorkerStopping(1));
 
     expect($called)->toBeTrue();
 });
