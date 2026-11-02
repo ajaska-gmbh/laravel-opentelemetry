@@ -3,16 +3,20 @@
 use Keepsuit\LaravelOpenTelemetry\Facades\Meter;
 use Keepsuit\LaravelOpenTelemetry\Facades\OpenTelemetry;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\Detectors\LongRunningCommandWorkerModeDetector;
+use Keepsuit\LaravelOpenTelemetry\WorkerMode\Detectors\QueueWorkerModeDetector;
+use Keepsuit\LaravelOpenTelemetry\WorkerMode\PeriodicWorkerModeDetectorInterface;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\WorkerModeDetectorInterface;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\WorkerModeManager;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\WorkerStoppingDetectorInterface;
 use Spatie\TestTime\TestTime;
 
-function stoppingDetector(): object
+function hookDetector(): object
 {
-    return new class implements WorkerModeDetectorInterface, WorkerStoppingDetectorInterface
+    return new class implements PeriodicWorkerModeDetectorInterface, WorkerModeDetectorInterface, WorkerStoppingDetectorInterface
     {
         public ?Closure $iteration = null;
+
+        public ?Closure $tick = null;
 
         public ?Closure $stopping = null;
 
@@ -26,6 +30,11 @@ function stoppingDetector(): object
             $this->iteration = $callback;
         }
 
+        public function onTick(Closure $callback): void
+        {
+            $this->tick = $callback;
+        }
+
         public function onWorkerStopping(Closure $callback): void
         {
             $this->stopping = $callback;
@@ -33,11 +42,40 @@ function stoppingDetector(): object
     };
 }
 
-test('collects on worker stopping regardless of the interval', function () {
+test('a tick collects metrics only when the interval is due', function () {
     TestTime::freezeAtSecond();
     Meter::shouldReceive('collect')->once();
 
-    $detector = stoppingDetector();
+    $detector = hookDetector();
+    new WorkerModeManager(metricsExportInterval: 60, detectors: [$detector]);
+
+    ($detector->tick)();
+    TestTime::addSeconds(59);
+    ($detector->tick)();
+    TestTime::addSeconds(1);
+    ($detector->tick)();
+    ($detector->tick)();
+});
+
+test('a tick never flushes, even when flushing after each iteration', function () {
+    TestTime::freezeAtSecond();
+    OpenTelemetry::shouldReceive('flush')->once();
+    Meter::shouldReceive('collect')->once();
+
+    $detector = hookDetector();
+    new WorkerModeManager(flushAfterEachIteration: true, metricsExportInterval: 60, detectors: [$detector]);
+
+    ($detector->tick)();
+    ($detector->iteration)();
+    TestTime::addSeconds(60);
+    ($detector->tick)();
+});
+
+test('worker stopping flushes everything regardless of the interval', function () {
+    TestTime::freezeAtSecond();
+    OpenTelemetry::shouldReceive('flush')->once();
+
+    $detector = hookDetector();
     new WorkerModeManager(metricsExportInterval: 60, detectors: [$detector]);
 
     ($detector->stopping)();
@@ -45,69 +83,65 @@ test('collects on worker stopping regardless of the interval', function () {
 
 test('an export failure never reaches the worker', function () {
     TestTime::freezeAtSecond();
-    Meter::shouldReceive('collect')->once()->andThrow(new RuntimeException('collector down'));
+    OpenTelemetry::shouldReceive('flush')->once()->andThrow(new RuntimeException('collector down'));
 
-    $detector = stoppingDetector();
+    $detector = hookDetector();
     new WorkerModeManager(metricsExportInterval: 60, detectors: [$detector]);
 
     $log = tempnam(sys_get_temp_dir(), 'otel');
     $previous = ini_set('error_log', $log);
 
-    expect(fn () => ($detector->stopping)())->not->toThrow(RuntimeException::class)
-        ->and(file_get_contents($log))->toContain('worker mode metrics export failed: collector down');
-
-    ini_set('error_log', $previous ?: '');
-    unlink($log);
+    try {
+        expect(fn () => ($detector->stopping)())->not->toThrow(RuntimeException::class)
+            ->and(file_get_contents($log))->toContain('worker mode metrics export failed: collector down');
+    } finally {
+        ini_set('error_log', $previous ?: '');
+        unlink($log);
+    }
 });
 
-test('a long-running command only collects on the interval, even when flushing every iteration', function () {
+test('an export cannot start another export', function () {
     TestTime::freezeAtSecond();
-    $ORIGINAL_SERVER = $_SERVER;
-    $_SERVER['APP_RUNNING_IN_CONSOLE'] = '1';
-    $_SERVER['argv'] = ['artisan', 'dialer:run'];
 
-    OpenTelemetry::shouldReceive('flush')->never();
-    Meter::shouldReceive('collect')->once();
+    $detector = hookDetector();
+    Meter::shouldReceive('collect')->once()->andReturnUsing(function () use ($detector) {
+        // e.g. an observable gauge callback that queries the database
+        TestTime::addSeconds(120);
+        ($detector->tick)();
 
-    $detector = new class(['dialer:run']) extends LongRunningCommandWorkerModeDetector
-    {
-        public ?Closure $callback = null;
+        return true;
+    });
 
-        public function onIterationEnded(Closure $callback): void
-        {
-            $this->callback = $callback;
-        }
-    };
+    new WorkerModeManager(metricsExportInterval: 60, detectors: [$detector]);
 
-    new WorkerModeManager(flushAfterEachIteration: true, metricsExportInterval: 60, detectors: [$detector]);
-
-    ($detector->callback)();
-    TestTime::addSeconds(30);
-    ($detector->callback)();
-    TestTime::addSeconds(31);
-    ($detector->callback)();
-
-    $_SERVER = $ORIGINAL_SERVER;
+    TestTime::addSeconds(60);
+    ($detector->tick)();
 });
 
-test('the provider adds the long-running command detector from the environment', function () {
+test('the provider adds the long-running command detector when the published config lacks the key', function () {
     $ORIGINAL_SERVER = $_SERVER;
-    $_SERVER['APP_RUNNING_IN_CONSOLE'] = '1';
-    $_SERVER['argv'] = ['artisan', 'dialer:run'];
-    config()->set('opentelemetry.worker_mode.long_running_commands', null);
-    putenv('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS=app:run, dialer:run');
-    $_ENV['OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS'] = 'app:run, dialer:run';
 
-    app()->forgetInstance(WorkerModeManager::class);
-    $manager = app(WorkerModeManager::class);
+    try {
+        $_SERVER['APP_RUNNING_IN_CONSOLE'] = '1';
+        $_SERVER['argv'] = ['artisan', 'dialer:run'];
+        // An app config published before the key existed: its own detector list, no long_running_commands.
+        config()->set('opentelemetry.worker_mode', [
+            'flush_after_each_iteration' => false,
+            'metrics_collect_interval' => 60,
+            'detectors' => [QueueWorkerModeDetector::class],
+        ]);
+        putenv('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS=app:run, dialer:run');
 
-    $detectors = (fn () => $this->detectors)->call($manager);
-    $longRunning = array_values(array_filter($detectors, fn ($d) => $d instanceof LongRunningCommandWorkerModeDetector));
+        app()->forgetInstance(WorkerModeManager::class);
+        $manager = app(WorkerModeManager::class);
 
-    expect($longRunning)->toHaveCount(1)
-        ->and((fn () => $this->commands)->call($longRunning[0]))->toBe(['app:run', 'dialer:run']);
+        $detectors = (fn () => $this->detectors)->call($manager);
+        $longRunning = array_values(array_filter($detectors, fn ($d) => $d instanceof LongRunningCommandWorkerModeDetector));
 
-    putenv('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS');
-    unset($_ENV['OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS']);
-    $_SERVER = $ORIGINAL_SERVER;
+        expect($longRunning)->toHaveCount(1)
+            ->and((fn () => $this->commands)->call($longRunning[0]))->toBe(['app:run', 'dialer:run']);
+    } finally {
+        putenv('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS');
+        $_SERVER = $ORIGINAL_SERVER;
+    }
 });

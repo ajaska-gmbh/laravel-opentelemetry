@@ -7,6 +7,8 @@ use Keepsuit\LaravelOpenTelemetry\Facades\Meter;
 use Keepsuit\LaravelOpenTelemetry\Facades\OpenTelemetry;
 use Throwable;
 
+use function Safe\error_log;
+
 class WorkerModeManager
 {
     protected int $lastMetricsExportTimestamp;
@@ -33,11 +35,11 @@ class WorkerModeManager
     {
         foreach ($this->detectors as $detector) {
             if ($detector->detect()) {
-                // A long-running command "iterates" on every query and HTTP response, far too often
-                // to flush everything each time: it only ever collects metrics on the interval.
-                $detector->onIterationEnded($detector instanceof Detectors\LongRunningCommandWorkerModeDetector
-                    ? fn () => $this->collectIfDue()
-                    : fn () => $this->handleIterationEnded());
+                $detector->onIterationEnded(fn () => $this->handleIterationEnded());
+
+                if ($detector instanceof PeriodicWorkerModeDetectorInterface) {
+                    $detector->onTick(fn () => $this->collectIfDue());
+                }
 
                 if ($detector instanceof WorkerStoppingDetectorInterface) {
                     $detector->onWorkerStopping(fn () => $this->handleWorkerStopping());
@@ -67,12 +69,13 @@ class WorkerModeManager
     }
 
     /**
-     * Export whatever is pending before the worker stops, regardless of the interval.
+     * Export everything pending (traces, metrics, logs) before the worker stops, regardless of
+     * the interval: a worker killed after a job timeout runs no shutdown functions.
      */
     protected function handleWorkerStopping(): void
     {
         $this->lastMetricsExportTimestamp = Carbon::now()->getTimestamp();
-        $this->export(fn () => $this->flushAfterEachIteration ? OpenTelemetry::flush() : Meter::collect());
+        $this->export(fn () => OpenTelemetry::flush());
     }
 
     /**

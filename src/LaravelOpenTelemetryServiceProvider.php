@@ -22,8 +22,8 @@ use Keepsuit\LaravelOpenTelemetry\Support\SamplerBuilder;
 use Keepsuit\LaravelOpenTelemetry\Support\UserContextResolver;
 use Keepsuit\LaravelOpenTelemetry\TailSampling\TailSamplingProcessor;
 use Keepsuit\LaravelOpenTelemetry\TailSampling\TailSamplingRuleInterface;
-use Keepsuit\LaravelOpenTelemetry\WorkerMode\WorkerModeDetectorInterface;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\Detectors\LongRunningCommandWorkerModeDetector;
+use Keepsuit\LaravelOpenTelemetry\WorkerMode\WorkerModeDetectorInterface;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\WorkerModeManager;
 use OpenTelemetry\API\Common\Time\Clock;
 use OpenTelemetry\API\Instrumentation\CachedInstrumentation;
@@ -528,8 +528,10 @@ class LaravelOpenTelemetryServiceProvider extends PackageServiceProvider
      */
     protected function longRunningCommands(): array
     {
+        // Read at runtime as a fallback: under config:cache only real process env vars (as set by
+        // Kubernetes) resolve here, not values that exist only in .env.
         $commands = config('opentelemetry.worker_mode.long_running_commands')
-            ?? env('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS', '');
+            ?: env('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS', ''); // @phpstan-ignore larastan.noEnvCallsOutsideOfConfig
 
         if (is_string($commands)) {
             $commands = explode(',', $commands);

@@ -349,12 +349,18 @@ return [
 
 - **Queue and Horizon workers** collect every `metrics_collect_interval` after a job, and on every
   pass of the worker loop (`Looping`), so an idle worker still exports what it recorded. They also
-  export everything pending on `WorkerStopping`, which covers a worker that kills itself after a
-  job timeout and therefore never runs its shutdown functions.
+  flush everything pending (traces, metrics, logs) on `WorkerStopping`, which covers a worker that
+  kills itself after a job timeout and therefore never runs its shutdown functions. That flush is
+  bounded only by the OTLP exporter timeout and retries, so keep those low for queue workers.
 - **Long-running console commands** named in `long_running_commands` collect every
   `metrics_collect_interval`, checked after each database query or outgoing HTTP response (the
   points where a command is between operations). They are registered even when an app's published
   config has its own `detectors` list. Without this, such a command exports only when it exits.
+  Entries are bare command names (`dialer:run`, not `dialer:run --max-runtime=86400`), matched
+  against the first argument after `artisan`. Collection is skipped while a database transaction
+  is open. Under `config:cache` the env var must be a real process env var, not only in `.env`.
+- These periodic points (`Looping`, and the long-running hooks) only ever collect metrics; they
+  never flush traces or logs, even with `flush_after_each_iteration`.
 - Exports in these hooks never throw into the worker; a failure is written to the PHP error log.
 
 ## User Context
