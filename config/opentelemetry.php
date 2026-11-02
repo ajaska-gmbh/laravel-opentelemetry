@@ -281,6 +281,13 @@ return [
         'metrics_collect_interval' => (int) env('OTEL_WORKER_MODE_COLLECT_INTERVAL', 60),
 
         /**
+         * Long-running console commands (daemons) that should export metrics while they run,
+         * every metrics_collect_interval, instead of only when they exit.
+         * Comma-separated in the env var, e.g. OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS="app:run,dialer:run"
+         */
+        'long_running_commands' => array_values(array_filter(array_map('trim', explode(',', (string) env('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS', ''))))),
+
+        /**
          * Detectors to use for worker mode detection
          *
          * Detectors are checked in order, the first one that returns true determines the mode.
@@ -289,6 +296,8 @@ return [
          * Built-in detectors:
          * - OctaneDetector: Detects Laravel Octane
          * - QueueDetector: Detects Laravel default queue worker and Laravel Horizon
+         *
+         * LongRunningCommandWorkerModeDetector is added automatically for long_running_commands.
          */
         'detectors' => [
             WorkerMode\Detectors\OctaneWorkerModeDetector::class,

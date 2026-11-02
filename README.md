@@ -319,6 +319,13 @@ return [
         'metrics_collect_interval' => (int) env('OTEL_WORKER_MODE_COLLECT_INTERVAL', 60),
 
         /**
+         * Long-running console commands (daemons) that should export metrics while they run,
+         * every metrics_collect_interval, instead of only when they exit.
+         * Comma-separated in the env var, e.g. OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS="app:run,dialer:run"
+         */
+        'long_running_commands' => array_values(array_filter(array_map('trim', explode(',', (string) env('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS', ''))))),
+
+        /**
          * Detectors to use for worker mode detection
          *
          * Detectors are checked in order, the first one that returns true determines the mode.
@@ -327,6 +334,8 @@ return [
          * Built-in detectors:
          * - OctaneDetector: Detects Laravel Octane
          * - QueueDetector: Detects Laravel default queue worker and Laravel Horizon
+         *
+         * LongRunningCommandWorkerModeDetector is added automatically for long_running_commands.
          */
         'detectors' => [
             WorkerMode\Detectors\OctaneWorkerModeDetector::class,
@@ -335,6 +344,18 @@ return [
     ],
 ];
 ```
+
+#### When worker processes export metrics
+
+- **Queue and Horizon workers** collect every `metrics_collect_interval` after a job, and on every
+  pass of the worker loop (`Looping`), so an idle worker still exports what it recorded. They also
+  export everything pending on `WorkerStopping`, which covers a worker that kills itself after a
+  job timeout and therefore never runs its shutdown functions.
+- **Long-running console commands** named in `long_running_commands` collect every
+  `metrics_collect_interval`, checked after each database query or outgoing HTTP response (the
+  points where a command is between operations). They are registered even when an app's published
+  config has its own `detectors` list. Without this, such a command exports only when it exits.
+- Exports in these hooks never throw into the worker; a failure is written to the PHP error log.
 
 ## User Context
 

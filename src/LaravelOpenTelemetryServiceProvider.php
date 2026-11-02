@@ -23,6 +23,7 @@ use Keepsuit\LaravelOpenTelemetry\Support\UserContextResolver;
 use Keepsuit\LaravelOpenTelemetry\TailSampling\TailSamplingProcessor;
 use Keepsuit\LaravelOpenTelemetry\TailSampling\TailSamplingRuleInterface;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\WorkerModeDetectorInterface;
+use Keepsuit\LaravelOpenTelemetry\WorkerMode\Detectors\LongRunningCommandWorkerModeDetector;
 use Keepsuit\LaravelOpenTelemetry\WorkerMode\WorkerModeManager;
 use OpenTelemetry\API\Common\Time\Clock;
 use OpenTelemetry\API\Instrumentation\CachedInstrumentation;
@@ -502,12 +503,42 @@ class LaravelOpenTelemetryServiceProvider extends PackageServiceProvider
                 ->filter()
                 ->all();
 
+            // Registered outside `detectors`: apps that publish the config keep their own detector
+            // list, which would otherwise never contain this one.
+            $longRunningCommands = $this->longRunningCommands();
+            if ($longRunningCommands !== []) {
+                $detectors[] = new LongRunningCommandWorkerModeDetector($longRunningCommands);
+            }
+
             return new WorkerModeManager(
                 flushAfterEachIteration: config()->boolean('opentelemetry.worker_mode.flush_after_each_iteration', false),
                 metricsExportInterval: config()->integer('opentelemetry.worker_mode.metrics_collect_interval', 60),
                 detectors: $detectors
             );
         });
+    }
+
+    /**
+     * Console commands that run for hours and must export metrics while they run.
+     *
+     * From `opentelemetry.worker_mode.long_running_commands`, or OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS
+     * (comma-separated) for apps whose published config predates the key.
+     *
+     * @return list<string>
+     */
+    protected function longRunningCommands(): array
+    {
+        $commands = config('opentelemetry.worker_mode.long_running_commands')
+            ?? env('OTEL_WORKER_MODE_LONG_RUNNING_COMMANDS', '');
+
+        if (is_string($commands)) {
+            $commands = explode(',', $commands);
+        }
+
+        return array_values(array_filter(array_map(
+            fn ($command) => trim((string) $command),
+            is_array($commands) ? $commands : []
+        )));
     }
 
     /**
