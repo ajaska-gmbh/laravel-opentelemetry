@@ -5,15 +5,19 @@ use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Str;
 use Keepsuit\LaravelOpenTelemetry\Instrumentation\HorizonInstrumentation;
 use Keepsuit\LaravelOpenTelemetry\Instrumentation\Support\Horizon\JobMemoryStore;
+use Laravel\Horizon\Contracts\SupervisorRepository;
 use OpenTelemetry\SDK\Metrics\Data\Metric;
 
 beforeEach(function () {
     config()->set('cache.default', 'redis');
     Cache::store('redis')->lock(HorizonInstrumentation::LOCK_NAME)->forceRelease();
 
-    Redis::connection()->del(JobMemoryStore::RUNNING_KEY);
+    foreach (Redis::connection()->keys('queues:*') as $key) {
+        Redis::connection()->del(Str::after($key, config('database.redis.options.prefix')));
+    }
 
     foreach (Redis::connection()->keys(JobMemoryStore::PREFIX.'*') as $key) {
         Redis::connection()->del($key);
@@ -108,28 +112,77 @@ it('counts a failed job too', function () {
     expect((int) $raw['live|App\\Jobs\\Flaky|count'])->toBe(1);
 });
 
-it('tracks in-flight jobs and releases them on completion', function () {
+function fakeSupervisors(array $processes): void
+{
+    app()->bind(SupervisorRepository::class, fn () => new class($processes)
+    {
+        public function __construct(protected array $processes) {}
+
+        public function all(): array
+        {
+            return [(object) ['processes' => $this->processes]];
+        }
+    });
+}
+
+function reserve(string $queue, string $job, string $id, int $availableAt): void
+{
+    Redis::connection()->zadd("queues:{$queue}:reserved", $availableAt, json_encode(['uuid' => $id, 'displayName' => $job, 'attempts' => 1]));
+}
+
+it('counts running jobs per queue and class from the reserved sets', function () {
+    fakeSupervisors(['redis:live' => 2, 'redis:import-today,import' => 4]);
+    reserve('live', 'App\\Jobs\\Slow', 's1', time() + 600);
+    reserve('live', 'App\\Jobs\\Slow', 's2', time() + 600);
+    reserve('import', 'App\\Jobs\\Import', 'i1', time() + 600);
+
     registerInstrumentation(HorizonInstrumentation::class);
 
-    $job = fakeJob('App\\Jobs\\Slow', 'live', 's1');
-    event(new JobProcessing('redis', $job));
-
-    $store = new JobMemoryStore;
-    $running = collect($store->readRunning())->firstWhere('job', 'App\\Jobs\\Slow');
-    expect($running['running'])->toBe(1);
-
-    event(new JobProcessed('redis', $job));
-
-    $running = collect($store->readRunning())->firstWhere('job', 'App\\Jobs\\Slow');
-    expect($running['running'])->toBe(0);
+    expect(pointsByJob(memoryGauge(HorizonInstrumentation::METRIC_JOB_RUNNING)))
+        ->toBe(['live|App\\Jobs\\Slow' => 2, 'import|App\\Jobs\\Import' => 1]);
 });
 
-it('never reports a negative in-flight count', function () {
-    Redis::connection()->hset(JobMemoryStore::RUNNING_KEY, 'live|App\\Jobs\\Ghost', -3);
+it('does not count reserved jobs whose retry_after passed, as their worker is gone', function () {
+    fakeSupervisors(['redis:live' => 1]);
+    reserve('live', 'App\\Jobs\\Slow', 'alive', time() + 600);
+    reserve('live', 'App\\Jobs\\Slow', 'dead', time() - 5);
 
-    $running = collect((new JobMemoryStore)->readRunning())->firstWhere('job', 'App\\Jobs\\Ghost');
+    registerInstrumentation(HorizonInstrumentation::class);
 
-    expect($running['running'])->toBe(0);
+    expect(pointsByJob(memoryGauge(HorizonInstrumentation::METRIC_JOB_RUNNING)))
+        ->toBe(['live|App\\Jobs\\Slow' => 1]);
+});
+
+it('ignores queues no supervisor serves', function () {
+    fakeSupervisors(['redis:live' => 1]);
+    reserve('other', 'App\\Jobs\\Slow', 'o1', time() + 600);
+
+    registerInstrumentation(HorizonInstrumentation::class);
+
+    expect(pointsByJob(memoryGauge(HorizonInstrumentation::METRIC_JOB_RUNNING)))->toBe([]);
+});
+
+it('reports 0 running for a job class that ran in the window but is idle now', function () {
+    fakeSupervisors(['redis:live' => 1]);
+    registerInstrumentation(HorizonInstrumentation::class);
+
+    runFakeJob('App\\Jobs\\Done', 'live');
+
+    $store = new JobMemoryStore;
+    $current = invade($store)->bucketKey(HorizonInstrumentation::DEFAULT_INTERVAL, 0);
+    Redis::connection()->rename($current, invade($store)->bucketKey(HorizonInstrumentation::DEFAULT_INTERVAL, -1));
+
+    expect(pointsByJob(memoryGauge(HorizonInstrumentation::METRIC_JOB_RUNNING)))
+        ->toBe(['live|App\\Jobs\\Done' => 0]);
+});
+
+it('keeps no running bookkeeping of its own', function () {
+    fakeSupervisors(['redis:live' => 1]);
+    registerInstrumentation(HorizonInstrumentation::class);
+
+    event(new JobProcessing('redis', fakeJob('App\\Jobs\\Slow', 'live', 's1')));
+
+    expect(Redis::connection()->keys('otel:horizon:jobrunning'))->toBe([]);
 });
 
 it('publishes averages and the max from the rolling window', function () {
