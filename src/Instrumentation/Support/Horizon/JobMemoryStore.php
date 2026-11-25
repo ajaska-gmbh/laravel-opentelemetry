@@ -9,8 +9,6 @@ class JobMemoryStore
 {
     public const PREFIX = 'otel:horizon:jobmem:';
 
-    public const RUNNING_KEY = 'otel:horizon:jobrunning';
-
     public const KEEP_BUCKETS = 15;
 
     public const WINDOW_BUCKETS = 10;
@@ -38,18 +36,6 @@ class JobMemoryStore
             LUA,
             [$this->bucketKey($interval, 0)],
             [$this->field($queue, $job), (string) $peak, (string) $added, (string) ($interval * self::KEEP_BUCKETS)]
-        );
-    }
-
-    public function adjustRunning(string $queue, string $job, int $delta, int $interval): void
-    {
-        $this->eval(
-            <<<'LUA'
-            redis.call('HINCRBY', KEYS[1], ARGV[1], ARGV[2])
-            redis.call('EXPIRE', KEYS[1], ARGV[3])
-            LUA,
-            [self::RUNNING_KEY],
-            [$this->field($queue, $job), (string) $delta, (string) max(300, $interval * self::KEEP_BUCKETS)]
         );
     }
 
@@ -95,27 +81,6 @@ class JobMemoryStore
         }
 
         return array_values(array_filter($rows, fn (array $row): bool => $row['count'] > 0));
-    }
-
-    public function readRunning(): array
-    {
-        $rows = [];
-
-        foreach ($this->hgetall(self::RUNNING_KEY) as $field => $value) {
-            $parts = explode('|', (string) $field);
-
-            if (count($parts) !== 2) {
-                continue;
-            }
-
-            $rows[] = [
-                'queue' => $parts[0],
-                'job' => $parts[1],
-                'running' => max(0, (int) $value),
-            ];
-        }
-
-        return $rows;
     }
 
     public static function normalizeQueue(?string $queue): string

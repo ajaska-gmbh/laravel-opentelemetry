@@ -6,6 +6,7 @@ use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Queue\Events\JobFailed;
 use Illuminate\Queue\Events\JobProcessed;
 use Illuminate\Queue\Events\JobProcessing;
+use Illuminate\Queue\RedisQueue;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 use Keepsuit\LaravelOpenTelemetry\Facades\Meter;
@@ -13,6 +14,7 @@ use Keepsuit\LaravelOpenTelemetry\Instrumentation\Support\Horizon\JobMemoryStore
 use Laravel\Horizon\Contracts\JobRepository;
 use Laravel\Horizon\Contracts\MasterSupervisorRepository;
 use Laravel\Horizon\Contracts\MetricsRepository;
+use Laravel\Horizon\Contracts\SupervisorRepository;
 use Laravel\Horizon\Contracts\WorkloadRepository;
 use OpenTelemetry\API\Metrics\ObservableCallbackInterface;
 use OpenTelemetry\API\Metrics\ObserverInterface;
@@ -70,6 +72,7 @@ class HorizonInstrumentation implements Instrumentation
 
     public const METRIC_JOB_PROCESSED = 'laravel.horizon.job.processed';
 
+    /** Read from the queues' own `:reserved` sets, which Laravel keeps exact; no bookkeeping of ours to leak. */
     public const METRIC_JOB_RUNNING = 'laravel.horizon.job.running';
 
     /** Seconds between publishes, fleet-wide. Also the TTL of the election lock. */
@@ -154,8 +157,10 @@ class HorizonInstrumentation implements Instrumentation
                 }
 
                 try {
+                    $seen = [];
+
                     if ($memory) {
-                        $this->observeJobMemory(
+                        $seen = $this->observeJobMemory(
                             $memoryStore,
                             $interval,
                             $windowBuckets,
@@ -163,9 +168,10 @@ class HorizonInstrumentation implements Instrumentation
                             $memoryPeakMax,
                             $memoryAddedAvg,
                             $jobProcessed,
-                            $jobRunning,
                         );
                     }
+
+                    $this->observeRunning($jobRunning, $seen);
                 } catch (\Throwable) {
                     // Swallowed, and deliberately NOT reported: this package installs a `reportable`
                     // hook that records any reported exception on the ACTIVE SPAN and marks it
@@ -215,7 +221,7 @@ class HorizonInstrumentation implements Instrumentation
     {
         $events = app('events');
 
-        $events->listen(JobProcessing::class, function (JobProcessing $event) use ($store, $interval): void {
+        $events->listen(JobProcessing::class, function (JobProcessing $event): void {
             $key = $this->jobKey($event->job);
 
             self::$baselines[$key] = memory_get_usage(true);
@@ -224,12 +230,6 @@ class HorizonInstrumentation implements Instrumentation
                 memory_reset_peak_usage();
             }
 
-            $store->adjustRunning(
-                JobMemoryStore::normalizeQueue($event->job->getQueue()),
-                $event->job->resolveName(),
-                1,
-                $interval
-            );
         });
 
         $finish = function (JobProcessed|JobFailed $event) use ($store, $interval): void {
@@ -242,7 +242,6 @@ class HorizonInstrumentation implements Instrumentation
             $job = $event->job->resolveName();
 
             $store->record($queue, $job, $peak, $peak > $baseline ? $peak - $baseline : 0, $interval);
-            $store->adjustRunning($queue, $job, -1, $interval);
         };
 
         $events->listen(JobProcessed::class, $finish);
@@ -268,10 +267,12 @@ class HorizonInstrumentation implements Instrumentation
         ObserverInterface $peakMax,
         ObserverInterface $addedAvg,
         ObserverInterface $processed,
-        ObserverInterface $running,
-    ): void {
+    ): array {
+        $seen = [];
+
         foreach ($store->readWindow($interval, $windowBuckets) as $row) {
             $attributes = ['queue' => $row['queue'], 'job_name' => $row['job']];
+            $seen[$row['queue'].'|'.$row['job']] = $attributes;
             $count = max(1, (int) ($row['count'] ?? 0));
 
             $peakAvg->observe(intdiv((int) ($row['sum_peak'] ?? 0), $count), $attributes);
@@ -280,9 +281,89 @@ class HorizonInstrumentation implements Instrumentation
             $processed->observe((int) ($row['count'] ?? 0), $attributes);
         }
 
-        foreach ($store->readRunning() as $row) {
+        return $seen;
+    }
+
+    /**
+     * @param  array<string, array{queue: string, job_name: string}>  $seen  job classes that ran in the window; idle ones report 0 instead of vanishing
+     */
+    protected function observeRunning(ObserverInterface $running, array $seen): void
+    {
+        foreach ($this->reservedJobs() as $row) {
+            unset($seen[$row['queue'].'|'.$row['job']]);
             $running->observe($row['running'], ['queue' => $row['queue'], 'job_name' => $row['job']]);
         }
+
+        foreach ($seen as $attributes) {
+            $running->observe(0, $attributes);
+        }
+    }
+
+    /**
+     * Jobs workers currently hold, per queue and job class, from each served queue's `:reserved` set.
+     * Entries past their score (retry_after) belong to dead workers and are about to be retried, so they don't count.
+     *
+     * @return list<array{queue: string, job: string, running: int}>
+     */
+    protected function reservedJobs(): array
+    {
+        $now = time();
+        $counts = [];
+
+        foreach ($this->servedQueues() as [$connection, $queue]) {
+            $redisQueue = app('queue')->connection($connection);
+
+            if (! $redisQueue instanceof RedisQueue) {
+                continue;
+            }
+
+            $payloads = $redisQueue->getConnection()->zrangebyscore($redisQueue->getQueue($queue).':reserved', (string) $now, '+inf');
+
+            if (! is_array($payloads)) {
+                continue;
+            }
+
+            foreach ($payloads as $payload) {
+                try {
+                    $decoded = json_decode((string) $payload, true, 512, JSON_THROW_ON_ERROR);
+                } catch (\JsonException) {
+                    $decoded = null;
+                }
+
+                $job = is_array($decoded) ? (string) ($decoded['displayName'] ?? 'unknown') : 'unknown';
+                $key = $queue.'|'.$job;
+
+                $counts[$key] ??= ['queue' => $queue, 'job' => $job, 'running' => 0];
+                $counts[$key]['running']++;
+            }
+        }
+
+        return array_values($counts);
+    }
+
+    /**
+     * Distinct [connection, queue] pairs the running supervisors serve; a `balance: false`
+     * supervisor reports its queues joined with commas.
+     *
+     * @return list<array{0: string, 1: string}>
+     */
+    protected function servedQueues(): array
+    {
+        $pairs = [];
+
+        foreach (app(SupervisorRepository::class)->all() as $supervisor) {
+            foreach (array_keys((array) ($supervisor->processes ?? [])) as $key) {
+                [$connection, $queues] = array_pad(explode(':', (string) $key, 2), 2, '');
+
+                foreach (explode(',', $queues) as $queue) {
+                    if ($connection !== '' && $queue !== '') {
+                        $pairs[$connection.':'.$queue] = [$connection, $queue];
+                    }
+                }
+            }
+        }
+
+        return array_values($pairs);
     }
 
     protected function observeThroughput(ObserverInterface $perMinute, ObserverInterface $recent, ObserverInterface $failed): void
